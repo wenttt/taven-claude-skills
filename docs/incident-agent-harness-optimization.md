@@ -21,6 +21,7 @@
 | 反复查同一个地方原地打转 | gap fingerprint 停滞检测 | §6.3 |
 | 模型输出陷入复读死循环 | doom loop 检测 | §7.2 |
 | 中途插话丢失或污染工具结果 | 三安全点插话机制 | §8.1 |
+| 跨会话不积累、每次从零排查 | 分层记忆 + dream 固化 | §9 |
 
 ---
 
@@ -748,7 +749,96 @@ let block_recap = match (previous_status, previous_pause_message.as_deref()) {
 
 ---
 
-## 9. 子代理（Phase 4，规模化选项）
+## 9. 会话生命周期与跨会话记忆
+
+### 9.1 会话生命周期与多会话
+
+**单个会话的生命周期**（grok-build `17-sessions.md`）：
+
+```
+创建(UUIDv7, 按 cwd 分组落盘)
+  → 每轮增量追加 updates.jsonl / chat_history.jsonl / plan.json（§8.5）
+  → 每个用户 prompt 记文件快照进 rewind_points.jsonl
+  → 结束时自动写记忆摘要（纯元数据，零 LLM 成本）
+  → 之后可 resume / rewind / fork / compact
+```
+
+关键机制：
+
+- **rewind**：每个用户 prompt 处记录文件快照，`/rewind` 选任意早先点 → 恢复文件到该点状态 + 截断对话历史到该点。调查场景对应"回滚到某个假设分叉前重查"。
+- **fork**：`/fork [--worktree] [directive]` 从当前会话分叉新会话——继承对话前缀，可选进入独立 git worktree；`summary.json` 记录 parent session 引用，谱系可追。对应"同一事故并行探索两条假设路线"。
+- **多会话并行**：`/dashboard` 管理活跃的父会话与分叉；子代理会话存在常规会话树中，父会话只留 `subagents/meta.json` 指针。
+- **琐碎会话过滤**：少于 3 条实质 prompt 或用户文本少于 50 字节的会话，跳过归档——不让噪声进长期记忆。
+
+### 9.2 记忆系统：三层存储 + 混合检索
+
+**存储分层**（`xai-grok-memory/src/storage.rs`）：
+
+| 层 | 位置 | 内容 | 时间衰减 |
+|----|------|------|---------|
+| 全局 | `~/.grok/memory/MEMORY.md` | 跨项目的用户偏好、通用约定 | 常青不衰减 |
+| 项目 | `~/.grok/memory/{slug}-{hash8}/MEMORY.md` | 项目约定、架构决策 | 常青不衰减 |
+| 会话 | `{slug}-{hash8}/sessions/*.md` | 每会话日志与摘要 | 半衰期 14 天 |
+
+项目身份 = git `origin` remote 的 `org/repo` 形式（无 remote 则用目录路径）取 blake3 hash8——**同一仓库的 clone 和 worktree 天然共享一个记忆目录**。
+
+**写入的三个时机**，成本递增：
+
+1. **会话结束自动摘要**：纯对话元数据构建（消息计数 + 前几条实质 prompt 做主题），无 LLM 调用零延迟，每次必写；
+2. **`/flush` 手动 LLM 摘要**：捕获决策、模式、调试路径，压缩前或高产会话后使用；
+3. **对话式"记住 X"**：追加到 MEMORY.md 对应主题标题（`## Preferences` / `## Debugging`…）下，文件 watcher 增量重索引，当轮会话内即可检索到。
+
+**混合检索**（`xai-grok-memory/src/search.rs`）：
+
+```
+FTS5 BM25（关键词） + sqlite-vec KNN（语义，可选）
+  → 双命中: text_weight × fts + vector_weight × vec；单命中不罚分
+  → 时间衰减: 仅 session 层，decayed = base × e^(-λ×age_days)，λ = ln2/14
+  → 来源加权 + 访问频率 boost → min_score 过滤 → MMR 去冗
+  → 无向量嵌入时纯 FTS（text_weight=1.0）照常工作
+```
+
+**注入的两个时机**：新会话首轮自动检索并注入相关记忆（`min_score` 可配）；**auto-compaction 之后再检索一次**，找回压缩可能丢掉的上下文——记忆是压缩的保险。
+
+### 9.3 dream 固化：记忆自身的管理
+
+记忆不是只写不理——后台"做梦"合并会话日志为长期记忆（`xai-grok-memory/src/dream.rs`）。三道闸从便宜到贵：
+
+```rust
+// 1. 配置: dream.enabled
+// 2. 时间: 距上次固化 >= min_hours（默认 4 小时）
+// 3. 数量: 新增会话数 >= min_sessions（默认 3 个）
+pub fn check_dream_gates(...) -> DreamGate { ... }
+```
+
+固化 prompt 的五条规则（`DREAM_SYSTEM_PROMPT` 原文要点）：
+
+```
+1. Merge related information into coherent topic summaries
+2. Resolve contradictions — if a recent session disproves an older fact,
+   keep only the current truth
+3. Convert relative dates ("yesterday", "last week") to absolute dates
+4. Discard ephemeral details: greetings, tool output noise, message counts,
+   'Current state' and 'Next steps' sections
+5. Preserve decisions, rationale, architecture, preferences,
+   and problem/solution pairs
+If the session logs contain nothing worth persisting, respond with NO_REPLY.
+```
+
+预算：单次输入 32K 字符（既有记忆与新会话各占一半），输出 16K；并发用锁防重入。
+
+### 9.4 incident-locator 落地
+
+对应现有 past_investigations + verdict 闭环，四个补强点：
+
+1. **归档摘要分两级**：零成本元数据摘要每次必写（症状、涉及服务、结论级别、verdict）；LLM 摘要只在重要调查（ACCEPTED 或高影响面）时写——对应 auto-save 与 `/flush` 的分层。
+2. **检索加时间衰减**：普通调查记录按半衰期衰减（建议 30 天，事故模式比代码约定过时更快）；**被 ACCEPTED 的调查常青不衰减**——人工确认对应 grok 的 global/workspace 免衰减层。
+3. **dream 模式做知识固化**：积累 N 个已确认调查后，后台 LLM 合并成按服务/症状分主题的"事故模式手册"，矛盾时新结论胜、相对时间转绝对时间；这是"人确认归档=团队资产"的自动增值层，固化产物本身进入检索索引。
+4. **调查身份用 repo origin hash**：多人/多机部署时共享记忆目录的现成方案。
+
+---
+
+## 10. 子代理（Phase 4，规模化选项）
 
 单一调查涉及多服务时，主 agent 派**只读 explore 型子代理**并行查证：
 
@@ -760,7 +850,7 @@ let block_recap = match (previous_status, previous_pause_message.as_deref()) {
 
 ---
 
-## 10. 推理档位：按角色分配算力
+## 11. 推理档位：按角色分配算力
 
 **是什么**：grok-build 的"标准/深度模式"是同一模型的 reasoning effort 档位（六档：None/Minimal/Low/Medium/High/Xhigh），随采样请求的 `reasoning_effort` 字段透传给模型服务端；产品层的"Balanced/Deep"是服务端下发的展示映射（medium/xhigh）。harness 循环与工具在所有档位下行为一致。
 
@@ -772,7 +862,7 @@ let block_recap = match (previous_status, previous_pause_message.as_deref()) {
 | 对抗验证者（§5.2） | 高档 | 反驳论证需要深推理 |
 | 压缩摘要调用（§3.3） | None/最低 | 机械转写任务，要快要便宜（grok-build compaction 即 `reasoning_effort: None`） |
 | 停滞分类器（§2.4） | None/最低 | 小 prompt 二分类（grok-build 同） |
-| explore 子代理（§9） | 中档 | 广搜证据，深度需求有限 |
+| explore 子代理（§10） | 中档 | 广搜证据，深度需求有限 |
 
 档位解析优先级（子代理场景）：spawn 时显式指定 > 角色默认 > persona 默认 > 继承父会话。grok-build 的验证 skeptic 继承会话模型与档位；上表中"验证者用高档"是本设计的分配建议。
 
@@ -794,14 +884,14 @@ pub enum ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh }
 
 ---
 
-## 11. 实施路线
+## 12. 实施路线
 
 | 阶段 | 内容 | 验收方式 |
 |------|------|---------|
 | **P1 主动性**（~2天） | §2.1 门禁 + §2.2 纪律 + §2.3 续行指令并入 Notebook | fixture 实测：叙述无调用被拦截重采；无"要继续吗"式请示 |
 | **P2 信息与降级**（~3天） | §3.1 契约 + §3.2 分层裁剪 + §6.1 分级出口 + §6.2 三次规则 + §4.2 查空三分类 | 缺字段工单一次问齐；长调查中后段仍能引用首轮事实；无根因场景输出排除报告而非编造 |
 | **P3 准确性**（~3天） | §5.2 对抗验证者（单员起步）+ §5.1 断言→工具调用反向核对 + §7.1 重试分类表 + §3.3 压缩摘要升级 | 埋"伪根因" fixture：验证者能 refute；压缩后事故事实与假设板完整存活 |
-| **P4 规模化**（按需） | §5.2 三员 panel + §2.4 停滞分类器 + §6.3 fingerprint + §7.2 doom loop + §8.3 后台任务 + §9 子代理 | 真实事故回放（内网后） |
+| **P4 规模化**（按需） | §5.2 三员 panel + §2.4 停滞分类器 + §6.3 fingerprint + §7.2 doom loop + §8.4 后台任务 + §10 子代理 | 真实事故回放（内网后） |
 
 每阶段沿用现有验证方式：JUnit 回归 + DeepSeek + fixture 实测人工评估。
 
@@ -845,5 +935,6 @@ pub enum ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh }
 | 中途引导 / prompt 队列 | `acp_session_impl/interjection.rs`、`prompt_queue.rs` |
 | 后台任务 / monitor | `terminal/background_task.rs`、`xai-grok-tools/.../monitor/` |
 | 会话持久化 / checkpoint | `docs/user-guide/17-sessions.md`、`xai-grok-workspace/src/session/checkpoint.rs` |
+| 记忆系统 / dream | `xai-grok-memory/src/`（storage / search / dream）、`docs/user-guide/13-memory.md` |
 | 子代理 | `crates/common/xai-tool-types/src/task.rs`、`docs/user-guide/16-subagents.md` |
 | 基座 prompt | `crates/codegen/xai-grok-agent/templates/prompt.md` |
