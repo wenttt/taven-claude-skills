@@ -665,11 +665,74 @@ pub fn format_interjection(text: String) -> String {
 }
 ```
 
-### 8.2 prompt 队列优先级
+### 8.2 多轮衔接：任务完成后的信息补充
+
+用户第一轮任务做完后补充信息，grok-build 按会话状态分四条路径处理，没有独立的"补充 vs 新任务"分类器——**靠完整对话上下文让模型自己理解衔接关系，harness 只负责把该在场的状态钉在场**。
+
+**路径一：会话空闲（上一轮已完成）**——最常见路径：
+
+- 新消息入队开新 turn，**同一条 conversation 直接追加**。上一轮的全部工具结果仍在上下文（受 §3.2 裁剪管辖），todo 列表持久化在 `plan.json`。
+- 重量级前缀只构建一次：第一条用户消息携带 user_info / git status / AGENTS.md / skills 清单（`prompt_build.rs:379` "Build the custom-templated first user message"）；**后续轮只有 `<user_query>` 包装的正文**，环境上下文不重复注入。memory 召回同样只在首轮（`turn.rs:1805` `first_turn_memory_reminder`）。
+- 衔接的兜底是 TodoGate：上一轮待办未清时，补充轮结束会按旧待办提醒——所以任务真完成时要清 todo。
+
+**路径二：turn 正在跑**——两条支路：
+
+- **不打断**：走 §8.1 的 interjection，三安全点消化；
+- **打断**（send_now）：取消当前 turn，新消息插到队头立即执行。
+
+**路径三：goal 循环活跃**——特殊规则，**goal turn 永不被取消**；send_now 消息插到运行头之后 FIFO 排队，作为 goal 循环内的独立 turn 执行——objective、计划、纪律 reminder 全部还钉着，补充信息在这个框架内被消化（objective 本身冻结，补充影响的是实现路径而非契约）。用户真消息同时清扫队列里的合成自唤醒 prompts——人的输入优先于机器自续跑：
+
+```rust
+// prompt_queue.rs:213 — 打断判定：goal 活跃时 cancel 恒为 false
+let auto_send_now = turn_running && blocked_in_wait && !held_user_queue;
+let send_now = !item.origin.is_synthetic() && (send_now || auto_send_now);
+let cancel_running_turn = send_now && turn_running && !goal_active;
+// send_now 消息插到 running front 之后（从不顶掉它），多条 send_now 按 FIFO
+```
+
+```rust
+// prompt_queue.rs:130 — 用户消息优先：清扫排队中的合成唤醒
+if !origin.is_synthetic() && preempt_armed {
+    let dropped = state.sweep_pending_inputs(|i| i.origin.is_synthetic());
+    // 被清扫的任务完成通知解除已投递标记，下一轮以 reminder 形式重报，不静默吞掉
+    for id in dropped.iter().filter_map(|i| i.origin.completion_id()) {
+        auto_wake.remove(id);
+    }
+}
+```
+
+**路径四：任务曾以 Blocked/暂停收尾，补充信息后恢复**——最有借鉴价值的一条。恢复时重新注入全套规则（源码注释："the model may have lost context during the pause"），并带上一次暂停原因和明确的重评估指令（`goal.rs:1764`）：
+
+```rust
+let block_recap = match (previous_status, previous_pause_message.as_deref()) {
+    (GoalStatus::Blocked, Some(msg)) => format!(
+        "Previous state: Blocked.\n\
+         Previous block reason: {msg}\n\
+         Re-evaluate whether the blocker has been addressed. If yes, continue \
+         working. If no, you may block again with an updated reason.\n\n"
+    ),
+    (GoalStatus::InfraPaused, Some(msg)) => format!(
+        "Previous state: Paused (infrastructure error).\n\
+         Previous error: {msg}\n\
+         The prior turn failed due to infrastructure. Retry when the error \
+         condition is resolved.\n\n"
+    ),
+    _ => String::new(),
+};
+```
+
+**incident-locator 落地**：
+
+- 补充轮沿用现有"结论生命周期"判定（答疑不动结论 / 重新 submit 出新版本），grok-build 印证了其中的关键取向——不做前置分类，靠上下文 + 收尾动作判定。
+- 补充的事实（时间窗修正、新增服务名、变更记录）**更新 incident.md 契约对应字段**并记 EventStream 留痕——事故事实是输入不是目标，允许更新（这一点与 goal objective 冻结不同）；假设板随之标记受影响假设为待复核。
+- BLOCKED 状态的恢复照抄 block_recap：用户补了缺失信息（给了时间窗 / 开了权限 / 接入了数据源）后，恢复指令注入"上次阻塞原因 + 重新评估是否已解除，解除则继续，未解除可携新理由再次 blocked"。
+- 调查进行中的补充走 §8.1 插话安全点，永不取消进行中的调查轮。
+
+### 8.3 prompt 队列优先级
 
 排队规则（grok-build `prompt_queue.rs`）：用户消息优先于合成消息（自动续跑、唤醒），可清除排队中的合成消息，但**从不移除正在执行的队头**——保证运行中的调查轮完整落盘后再切换。
 
-### 8.3 后台/长任务
+### 8.4 后台/长任务
 
 长查询（大范围日志检索、慢 SQL）后台化执行：
 
@@ -677,7 +740,7 @@ pub fn format_interjection(text: String) -> String {
 - **完成即通知**：完成事件作为下一轮上下文的通知注入；工具描述写明"提交后无需轮询"。
 - **输出限速**：token bucket（容量 10，2 秒回填）防日志流刷爆上下文；持续超速 30 秒自动终止任务并如实报告。
 
-### 8.4 会话持久化（对齐增强现有 messages_json）
+### 8.5 会话持久化（对齐增强现有 messages_json）
 
 - 落盘格式统一 JSONL append-only：`chat_history.jsonl`（对话）、`events.jsonl`（EventStream）、`signals.json`（token/轮次统计）、`incident.md`（契约）、假设板快照。每轮增量追加，崩溃丢失面最小。
 - 恢复时重建：对话 + Notebook + 假设板 + 契约 + 未完成后台任务清单（附 reminder 提示模型"这些任务在你离开时仍在运行"）。
