@@ -23,6 +23,7 @@
 | [system-design](engineering/system-design/) | 系统架构 — 缓存/解耦/降级/背压的通用设计模式 |
 | [deploy-safety](engineering/deploy-safety/) | 安全部署 — 部署前/中/后检查、健康检查、回滚策略 |
 | [debug-method](engineering/debug-method/) | 系统排错 — 四步定位法、常见 bug 模式速查 |
+| [agent-harness](engineering/agent-harness/) | Agent Loop 设计 — 监督门禁、契约注入、失败状态机、降级出口（源自 grok-build 源码研读） |
 
 ### Decision 决策系统
 | Skill | Description |
