@@ -22,6 +22,8 @@
 | 模型输出陷入复读死循环 | doom loop 检测 | §7.2 |
 | 中途插话丢失或污染工具结果 | 三安全点插话机制 | §8.1 |
 | 跨会话不积累、每次从零排查 | 分层记忆 + dream 固化 | §9 |
+| 拿日志关键词 grep 代码查不到 | 代码定位四原语 | §4.5 |
+| 工具一多漏选错选、聊天里直接回答不查 | 工具集治理 + 入口仪式 + 双模式 | §12 |
 
 ---
 
@@ -371,6 +373,58 @@ pub fn truncate_with_preview(
     (format!("{preview}\n\n{footer}"), true)
 }
 ```
+
+### 4.5 代码定位原语（文本 grep 的补强）
+
+**是什么**：纯文本 grep 的结构性缺陷是搜索原料错配——模型手里是填值后的日志（`order 20260718001 pay failed: timeout`），代码里是格式串（`"order {} pay failed: {}"`），直接检索必然落空。本节把"想出好关键词"从模型职责转为工具层职责：四个确定性原语，全部不依赖模型能力。
+
+**原语一：stack_jump（堆栈直达，最高杠杆）**
+
+Java 事故日志几乎必带异常堆栈，堆栈帧是零搜索、零歧义的直达信号：
+
+```
+输入:  日志中的堆栈文本
+       at com.pay.OrderService.pay(OrderService.java:123)
+       at com.pay.api.PayController.submit(PayController.java:45)
+解析:  [{class: "com.pay.OrderService", method: "pay",
+         file: "OrderService.java", line: 123}, ...]
+执行:  包名前缀 → repo 路由表定位仓库 → 定位文件 → 取 line±30 行
+返回:  每帧一段源码，标注帧序（top = 异常抛出点，向下为调用链）
+```
+
+**原语二：日志骨架反查**
+
+```
+输入日志行: "order 20260718001 pay failed: timeout after 3000ms"
+1. 通配变量: 数字 / UUID / 十六进制 / 时间戳 / 引号内容 → ⟨*⟩
+   骨架: "order ⟨*⟩ pay failed: timeout after ⟨*⟩ms"
+2. 切常量片段（≥3 词或 ≥12 字符）: ["pay failed: timeout after", ...]
+3. 按片段长度降序逐个检索，命中即停
+4. 返回命中结果 + 实际使用的片段（模型能看到工具是怎么搜的）
+```
+
+**原语三：查空降阶链**
+
+```
+精确匹配 → 大小写不敏感 → 分词 AND → 分词 OR → 类名/文件名匹配
+每级记录 (pattern, 结果数)；全空时返回完整尝试清单 + 引导:
+"5 级降阶全空——关键词可能不在此 repo，建议换 repo 或改用 stack_jump"
+```
+
+模型不会自己变换关键词，工具替它变换；空结果永远伴随下一步建议（衔接 §4.2/§4.3）。
+
+**原语四：repo 路由表**
+
+```toml
+[repo_routing]
+"pay-service" = "repos/pay-service"   # 服务名 → repo
+"com.pay."    = "repos/pay-service"   # 包名前缀 → repo（stack_jump 路由用）
+"order-api"   = "repos/order-center"
+```
+
+两级检索：先路由到 repo 再搜；路由不中才广搜，且结果明示"广搜自 N 个 repo"。
+
+grok-build 的对应物是 codebase-graph（tree-sitter 符号索引 + goto_definition / goto_references）；在拿不到索引基建的环境里，上述四原语是纯文本方案的上限，实现成本一天级。
 
 ---
 
@@ -884,16 +938,133 @@ pub enum ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh }
 
 ---
 
-## 12. 实施路线
+## 12. 产品形态：聊天界面与双模式
+
+### 12.1 工具集治理
+
+工具选择准确率随工具数衰减；聊天场景还叠加"直接回答"这个零成本竞争选项——工具一多，"该查的不查"成为常态。三层治理：
+
+| 层 | 做法 | grok-build 对应物 |
+|----|------|------------------|
+| 按模式裁剪 | 普通模式仅挂 5-8 个高频查询工具；深度模式全量 | 子代理 `capability_mode`（read-only / read-write / execute / all）与类型化工具集 |
+| 按阶段暴露 | 契约未建立只挂 intake 类工具；进入取证阶段才挂日志/代码/DB | 工具集由 harness 每轮组装进请求，天然支持按状态增减 |
+| 同类合并 | 同一动作的数据源变体合并为一个工具 + `source` 枚举参数 | 单一 grep 工具 + glob/type 参数，而非每种目标一个工具 |
+
+原则：**工具不在上下文里，就不会被漏选或错选。** grok 的 explore 型约束原文（`xai-tool-types/src/task.rs`）：
+
+```
+**explore**: Fast, read-only agent specialized for codebase exploration.
+Read-only — has access to: read, list, search.
+```
+
+### 12.2 双模式：一套 harness，模式只是参数
+
+grok-build 实证：标准/深度的全部差异是采样请求里的一个 reasoning effort 字段（§11），循环、工具协议、验证机制完全同一套。双模式按同样哲学实现为**一套代码 + 一张参数表**：
+
+| 维度 | 普通模式 | 深度模式 |
+|------|---------|---------|
+| 定位 | 答疑、1-2 次工具调用的快查 | 完整事故调查 |
+| 模型档 | 普通档 | thinking 档（§11） |
+| 工具集 | 5-8 个高频查询 | 全量 + 子代理（§10） |
+| 入口 | 直接响应 | 契约 gate：缺必填字段一次问齐（§3.1） |
+| 预算 | 3-5 轮 | 20-40 轮 + token 预算 |
+| 门禁 / 纪律 / 续行指令 | 关 | 全开（§2） |
+| 验证 | 结构校验 | 结构校验 + 对抗验证者（§5.2） |
+| 出口 | 自由文本 | 分级结论（§6.1） |
+| 失败处理 | 直接说查不到 | 3 次规则 + 降级出口（§6.2） |
+
+模式路由：用户手选（grok 同样没有自动深浅路由——其 auto_mode 是权限分类器，与推理深度无关）。自动路由留作后续：便宜分类调用判定"快问题 vs 开调查"，先手选验证产品形态再考虑。
+
+### 12.3 聊天形态的调查纪律
+
+聊天界面的固有重力是模型退化为"凭知识直接回答"。对治：
+
+- **入口仪式**：深度模式启动即建 incident.md 契约、缺字段先问齐——"调查开始"是明确的状态切换，不是聊天的延续。
+- **纪律随态生效**：进入调查态后 §2 全套生效；普通模式不加纪律，保持轻快——用户对两种模式的预期（秒回 vs 慢而可靠）各自成立。
+- **插话与恢复**：调查轮永不被新消息取消（§8.2 路径三）；Blocked 收尾后用户补充信息，恢复时注入"上次阻塞原因 + 重新评估是否解除"（§8.2 路径四）。
+
+### 12.4 深度模式增强（推理较弱模型的补偿）
+
+1. **假设板 `verification` 必填字段**：每个假设登记时必须填验证方法（"查 X 服务 Y 时间段的 Z 日志"）。"推断下一步"从自由发挥变为结构化填表；门禁 nudge 直接引用（"假设 H2 的验证方法尚未执行"）——对应 grok 从计划 checklist 挖"第一个未完成步骤"做续行指令的机制。
+2. **排查决策表进 prompt**：症状→首查项映射（超时→线程池/连接池指标；数据错→同 ID 写入路径；5xx 突增→对照部署时间线）。给模型外挂资深工程师 playbook。
+3. **thinking 档按角色分配**：主 agent 与验证者开 thinking，压缩/分类杂务用普通档（§11 分配纪律）。
+
+---
+
+## 13. 整体蓝图：端到端流程与模块清单
+
+### 13.1 一次深度调查的完整时序
+
+```
+ 1. 用户消息进入（深度模式）
+ 2. [契约]   蒸馏为 incident.md；必填字段缺失 → 一次问齐          （§3.1）
+ 3. [循环]   每轮：
+    a. drain 插话 → 注入续行指令 <investigation-state>          （§8.1 §2.3）
+    b. 裁剪检查：>50% 窗口 → prune；>80% → 结构化压缩            （§3.2 §3.3）
+    c. 采样：thinking 档 / 重试分类表 / doom loop 监测           （§11 §7.1 §7.2）
+    d. 无工具调用 → 门禁：未出结论 → nudge + 重采（≤2 次）        （§2.1）
+    e. 有工具调用 → 执行（只读并行，需审批串行）：
+       日志/DB 工具 + 代码定位原语；查空三分类；截断 + 尾注引导    （§4.5 §4.2-4.4）
+    f. 结果回填；假设板更新（verification 字段）                 （§12.4）
+ 4. [收尾判定]
+    - 发布结论   → 结构校验 → 对抗验证者（≤2 轮打回）            （§5.1 §5.2）
+    - 声明 blocked → 3 次规则（前两次驳回引导换角度）             （§6.2）
+    - 指纹连续 3 轮不变 → NO_PROGRESS                          （§6.3）
+    - 预算耗尽   → 强制输出分级结论                             （§6.4）
+ 5. [交付]   分级结论（CONFIRMED/HYPOTHESES/ELIMINATION/BLOCKED）+ timeline（§6.1）
+ 6. [归档]   元数据摘要必写；ACCEPTED 调查加 LLM 摘要并免衰减      （§9.4）
+ 7. [续轮]   用户补充 → 四路径分流；记忆注入下一次调查首轮         （§8.2 §9.2）
+ 8. [固化]   积累 N 个确认调查 → dream 合并为事故模式手册          （§9.3）
+```
+
+### 13.2 模块清单
+
+| 模块 | 职责 | 章节 | grok-build 对应 |
+|------|------|------|----------------|
+| ModeRouter | 普通/深度模式的参数装配 | §12.2 | reasoning effort + model state |
+| IncidentContract | incident.md 蒸馏、字段 gate、更新留痕 | §3.1 §8.2 | goal planner / plan.md |
+| TurnLoop | 主循环 + 无工具门禁 + 续行指令 | §2 | `turn.rs` |
+| ContextManager | 分层裁剪 + 结构化压缩 + 压缩后记忆回补 | §3.2 §3.3 | `request_builder` / `compaction` |
+| ToolLayer | 五层工具设计 + 查空三分类 + 截断/引导 | §4.1-4.4 | `xai-grok-tools` |
+| CodeLocator | stack_jump / 骨架反查 / 降阶链 / 路由表 | §4.5 | `codebase-graph` 的文本替代 |
+| HypothesisBoard | 假设板 + verification 字段 + gap 指纹 | §12.4 §6.3 | todo/plan + `gap_fingerprint` |
+| Verifier | 对抗验证者（可扩三员冷面板） | §5 | `goal_classifier` / skeptics |
+| FailureStateMachine | 状态机 + 3 次规则 + 分级出口 | §6 | `goal_tracker` |
+| Sampler | 重试分类 + 退避 jitter + doom loop | §7 | `xai-grok-sampler` |
+| SessionRuntime | 插话安全点 + 队列优先级 + 落盘恢复 | §8 | `interjection` / `prompt_queue` / sessions |
+| MemoryStore | 三层记忆 + 混合检索 + dream 固化 | §9 | `xai-grok-memory` |
+
+### 13.3 核心数据结构
+
+```
+incident.md    契约（§3.1 模板）
+假设板条目      {id, statement, status: pending|verified|refuted,
+                verification: "验证方法", evidence: [引用 id...]}
+结论 JSON      {level: CONFIRMED|HYPOTHESES|ELIMINATION|BLOCKED,
+                causal_chain: [{claim, evidence_refs}], confidence,
+                verification_tags: [LOG_CONFIRMED|DB_VERIFIED|CODE_INFERRED]}
+验证者裁决      {refuted, findings[{kind, location, detail}],
+                evidence, confidence, blocking: none|contradiction|unverifiable}
+EventStream    TurnStarted / ToolCalled / GateFired / Steered / BlockedAttempt /
+                StateChanged / ConclusionPublished / VerdictRecorded
+会话目录        chat_history.jsonl / events.jsonl / incident.md /
+                hypotheses.json / signals.json（§8.5 §9.1）
+```
+
+---
+
+## 14. 实施路线
 
 | 阶段 | 内容 | 验收方式 |
 |------|------|---------|
-| **P1 主动性**（~2天） | §2.1 门禁 + §2.2 纪律 + §2.3 续行指令并入 Notebook | fixture 实测：叙述无调用被拦截重采；无"要继续吗"式请示 |
-| **P2 信息与降级**（~3天） | §3.1 契约 + §3.2 分层裁剪 + §6.1 分级出口 + §6.2 三次规则 + §4.2 查空三分类 | 缺字段工单一次问齐；长调查中后段仍能引用首轮事实；无根因场景输出排除报告而非编造 |
-| **P3 准确性**（~3天） | §5.2 对抗验证者（单员起步）+ §5.1 断言→工具调用反向核对 + §7.1 重试分类表 + §3.3 压缩摘要升级 | 埋"伪根因" fixture：验证者能 refute；压缩后事故事实与假设板完整存活 |
-| **P4 规模化**（按需） | §5.2 三员 panel + §2.4 停滞分类器 + §6.3 fingerprint + §7.2 doom loop + §8.4 后台任务 + §10 子代理 | 真实事故回放（内网后） |
+| **P1 主动性**（~2天） | §2.1 门禁 + §2.2 纪律 + §2.3 续行指令 | fixture 实测：叙述无调用被拦截重采；无"要继续吗"式请示 |
+| **P2 证据获取**（~2天） | §4.5 四原语 + §4.2 查空三分类 + §12.1 工具集裁剪 | 失败案例回归：堆栈能直达代码；查空后有降阶与下一步 |
+| **P3 信息与降级**（~3天） | §3.1 契约 + §3.2 分层裁剪 + §6.1 分级出口 + §6.2 三次规则 | 缺字段一次问齐；长调查后段仍引用首轮事实；无根因场景输出排除报告而非编造 |
+| **P4 准确性**（~3天） | §5.2 对抗验证者（单员起步）+ §5.1 断言→工具调用反向核对 + §12.4 假设板字段与 thinking 分配 + §3.3 压缩摘要 | 埋"伪根因" fixture：验证者能 refute；压缩后事故事实与假设板完整存活 |
+| **P5 双模式产品化**（~2天） | §12.2 参数表 + §12.3 入口仪式与插话恢复 + §7.1 重试分类表 | 普通模式轻快不受纪律拖累；深度模式全机制生效；调查中插话不打断 |
+| **P6 规模化**（按需） | §5.2 三员 panel + §2.4 停滞分类器 + §6.3 fingerprint + §7.2 doom loop + §8.4 后台任务 + §10 子代理 + §9.3 dream 固化 | 真实事故回放 |
 
-每阶段沿用现有验证方式：JUnit 回归 + DeepSeek + fixture 实测人工评估。
+改造前先从运行记录挑 2-3 个失败案例做成回归 fixture，每个阶段跑一遍——没有失败案例回归，无法归因哪一刀起了作用。
 
 ---
 
