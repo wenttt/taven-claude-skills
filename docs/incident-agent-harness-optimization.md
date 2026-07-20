@@ -1109,3 +1109,67 @@ EventStream    TurnStarted / ToolCalled / GateFired / Steered / BlockedAttempt /
 | 记忆系统 / dream | `xai-grok-memory/src/`（storage / search / dream）、`docs/user-guide/13-memory.md` |
 | 子代理 | `crates/common/xai-tool-types/src/task.rs`、`docs/user-guide/16-subagents.md` |
 | 基座 prompt | `crates/codegen/xai-grok-agent/templates/prompt.md` |
+
+## 附录 C：样例走查——一次完整调查长什么样
+
+> 本附录是全套机制组装后的行为基准（黄金样例）。交给实现者（人或 AI）时，以此为验收目标：实现完成后，同类场景应产生同构的行为轨迹。
+
+**场景**：用户在深度模式贴入告警——"pay-service 14:02 开始 5xx 告警，部分用户支付失败"。
+
+```
+[契约轮]
+  agent 蒸馏 → incident.md{时间窗: 14:02起, 服务: pay-service, 症状: 5xx/支付失败}
+  必填字段"关联变更"缺失 → 一次问齐："影响面多大？14 点前后有发版或配置变更吗？"
+  用户："14:00 发过一版。" → 契约完成，排查计划生成，调查态开启（§3.1 §12.3）
+
+[Turn 1]  续行指令注入（事故摘要+假设板+预算）
+  假设板登记（verification 必填，§12.4）：
+    H1 新发布引入缺陷      | verification: 对照部署 diff 与异常起点
+    H2 下游依赖故障        | verification: 查下游调用错误与延迟
+    H3 资源耗尽            | verification: 查连接池/线程池指标与日志
+  log_search(pay-service, 14:00-14:10, ERROR)
+  → 命中 at least 32000 行（截断）+ 尾注引导（§4.3）→ 收窄重查
+  → 高频错误: "connection pool exhausted" + 异常堆栈
+
+[Turn 2]  stack_jump(堆栈)（§4.5 原语一）
+  → 包名 com.pay. 路由到 repos/pay-service → 直达 PaymentClient.java:88
+  → 源码显示：对下游 HTTP 调用超时配置 30s
+  骨架反查 "connection pool exhausted"（原语二）→ HikariCP 池配置 max=20
+
+[Turn 3]  deploy_recent(pay-service)
+  → 14:00 发布 diff：调用超时 3s → 30s
+  假设板更新：H1+H3 合并为复合链 "下游变慢 × 30s 超时 → 池占满 → 5xx"（pending）
+
+[Turn 4]  metric_query(下游 P99) → 14:01 起 200ms → 8s；H2 升级为触发因素候选
+  假设板：H1(促成) H2(触发) H3(表象) 全部 verified 待终审
+
+[Turn 5]  发布结论 → 结构校验通过（引用溯源 OK）
+  → 对抗验证者（thinking 档，§5.2）refute：
+    "时间线未闭合——下游 14:01 变慢先于告警但晚于发布，未排除下游自身故障，
+     查下游服务自身日志。" → 打回（gap 明确）
+
+[Turn 6]  log_search(下游服务, 14:00-14:05) → 发现 GC 风暴日志
+  修订因果链：触发=下游 GC 风暴；促成=本服务超时 3s→30s 放大占用；表象=池耗尽
+  → 再验证 → Not Refuted
+
+[交付]  CONFIRMED 级结论（§6.1）：
+  因果链三跳，每跳带证据引用（日志行 id / PaymentClient.java:88 / 部署 diff / 指标截图）
+  + 置信度 + verification 标签 + 还不确定的点 + 建议排查方向
+  timeline 完整可展开，人工 verdict 待定
+
+[归档]  元数据摘要必写；人工 ACCEPTED 后升免衰减层 + LLM 摘要（§9.4）
+  未来 dream 固化进"连接池耗尽"模式条目（§9.3），下次同类事故首轮即被召回
+```
+
+**非理想路径的行为基准**（同一场景的三个变体）：
+
+- 时间窗内查无日志 → 工具返回 `NoData` + "这是排除性证据"提示，agent 记入排除链并扩窗/换源，而非停住（§4.2）；
+- 连续声明查不到 → 前两次被"1/3 recorded，换角度：扩时间窗/查上游/对照变更"驳回，第三次转 BLOCKED，输出阻塞报告（缺什么数据源、需要什么权限）（§6.2）；
+- 用户次日补充"当时下游也在报警" → BLOCKED 恢复，注入"上次阻塞原因 + 重新评估是否解除"，调查从假设板现状继续而非从零开始（§8.2 路径四）。
+
+## 附录 D：交给实现者（人或 AI）的交接说明
+
+1. **附上代码库上下文**：本文档不指定语言/框架；交接时须同时给出目标项目结构，并把 §13.2 模块清单逐行映射到项目中的现有类/待建类（哪些已有、哪些新建、哪些改造）。
+2. **按 §14 分阶段交付**：一个阶段一个 PR，每阶段结束跑失败案例回归——禁止一次性实现全部机制后再验证。
+3. **以附录 C 为验收基准**：实现完成后，用同构场景实测，行为轨迹应与走查一致（契约先行、堆栈直达、查空有降阶、结论过验证者、失败有分级出口）。
+4. **prompt 类资产直接取用**：§2.2 纪律三条、§3.3 压缩摘要、§5.2 验证者人设、§8.2 block_recap 均可按原文改写；机制类代码以文中 grok-build 原实现（Rust）为语义基准翻译。
