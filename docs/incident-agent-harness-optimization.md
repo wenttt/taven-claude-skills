@@ -1,5 +1,7 @@
 # incident-locator Agent Harness 优化设计
 
+> **本文档已降格为机制库**：架构主文档见 [incident-agent-architecture-v2.md](incident-agent-architecture-v2.md)（平台世界模型架构，"模型为核、循环为翼"）。本文继续维护 grok-build 源码摘录、循环监督机制细节与参数速查，v2 按节引用。
+>
 > 依据：xai-org/grok-build（Apache 2.0，2026-07 开源）全量源码研读。
 > 目标：解决 incident-locator 当前的四类问题——不主动调用工具、不理解/遗忘用户信息、结论不准、非理想路径（查不到 / 证据模糊 / 信息不够）处理粗糙。
 > 核心设计思想：**agent 的可靠性来自 harness 层的监督机制。grok-build 的基座 system prompt 仅 45 行，可靠性由主循环防守、契约注入、工具层设计、对抗验证、失败状态机五个子系统提供。**
