@@ -23,7 +23,7 @@
 | 平台审计日志 | **平台自身**的操作审计（谁在平台上做了什么）存在哪里、是否有查询接口——这是 M1 的命脉，没有就在映射表里显著标注 |
 | 平台实体 | 租户/任务/策略/存储 的数据模型与 DB 表 |
 
-映射表交付并确认后，按工单 1→6 顺序施工（6a/6b 可与 M1 并行提前——推送面不依赖世界模型；防火墙放行单第一周就递）。
+映射表交付并确认后，按工单 1→5 顺序施工。
 
 ---
 
@@ -78,21 +78,6 @@
 
 历史调查记录增加实体关联（团队/服务/表），检索支持按实体查（"这个租户过去的事故"）。有 dream 固化机制的按 v1 §9.3 接入；没有则只做实体化检索。
 
-## 工单 6（M6）：Teams 接入面（内网部署版）
-
-**目标**：调查结论主动出现在 Teams 频道；交互（追问/审批/裁决）留在内网聊天详情页。部署约束：agent 服务器在内网、外部不可达——因此只做"出站推送"，Outgoing Webhook / Azure Bot 类需微软云回调服务器的方案不适用。
-
-**6a. TeamsNotifier（推送核心，与推送通道解耦）**：新增 `TeamsNotifier`（契约附录 B-5）。调查轮结束（结论已过验证者）时产出一张 Adaptive Card：摘要 + 定责 + 级别/置信 + "查看完整调查"链接。**链接指向内网聊天详情页**（点击者都在办公网/VPN,可达）。卡片投递走 6b 选定的通道；通道未配置时静默禁用，投递失败只记事件不抛错。
-
-**6b. 推送通道（三选一，按可用性递补）**：
-1. **代理直发（首选）**：服务器经公司正向代理出站 POST 到 Teams Workflows 入站 webhook URL（频道 → 工作流 → "收到 Webhook 请求时发布到频道"模板取得；老 Office 365 Connectors 已退役勿用）。需要一张防火墙放行单：服务器 → webhook 主机名（`*.logic.azure.com` 类）、HTTPS 出站、单域名。环境变量：`AGENT_TEAMS_WEBHOOK`、`AGENT_HTTPS_PROXY`。
-2. **中继桥（放行单批复前的过渡）**：在一台可同时访问内网与公网的机器上跑轮询脚本：定期 GET `/api/investigations` 发现新完成调查 → 取详情组卡 → POST webhook。脚本随本工单交付（独立小程序，任何语言），agent 侧零改动。
-3. **邮件桥（保底）**：Teams 频道邮箱地址（频道 → 获取电子邮件地址）+ 内网 SMTP relay 发纯文本通知（无卡片格式）。环境变量：`AGENT_SMTP_HOST`、`AGENT_TEAMS_CHANNEL_EMAIL`。
-
-**明确不做**：Outgoing Webhook 追问、Azure Bot——均要求微软云回调内网服务器，网络拓扑不允许。追问面 = 卡片链接进入内网聊天页，能力零损失。
-
-**验收**：跑一次完整调查，测试频道收到通知（卡片或邮件），链接在办公网可打开对应调查详情；通道未配置/不可达时主流程零影响；中继桥脚本重复轮询不重复推送（幂等）。
-
 ---
 
 ## 附录 A：tenants.yaml schema
@@ -139,16 +124,6 @@ teams:
 ```json
 {"id":"H1","hypothesis":"...","status":"TESTING",
  "verification":[{"tool":"audit_query","params":{...},"expect":"命中则支持/命中则否定"}]}
-```
-
-**B-5 TeamsNotifier**
-```json
-{"config":{"AGENT_TEAMS_WEBHOOK":"Workflows 入站 webhook URL（未设置=禁用）",
-           "AGENT_TEAMS_HMAC":"6b outgoing webhook 的签名密钥"},
- "notify(investigation)":"POST Adaptive Card v1.4，超时 5s，失败仅记事件",
- "card":{"body":["TextBlock: 调查完成 · {id}","TextBlock: {summary，wrap}",
-   "FactSet: 定责 attribution.verdict(+team) / 级别 level · 置信 topConfidence / 验证 是否过验证者"],
-  "actions":[{"Action.OpenUrl":"{chat_base_url}/chat#{investigationId}"}]}}
 ```
 
 ## 附录 C：施工纪律
