@@ -1,7 +1,7 @@
 # v2 实施交接包（给实现方 AI 的施工文档）
 
 > 你是实现方。本文档是你的施工指令，配套阅读：[架构 v2](incident-agent-architecture-v2.md)（做什么、为什么）与 [v1 机制库](incident-agent-harness-optimization.md)（被引用的机制细节与参考实现）。
-> 铁律：①在现有代码基础上增量改造，禁止另起炉灶重写；②一个工单一个 PR，每个 PR 跑全量回归；③不用假数据糊弄，工具查不到就如实返回查不到；④所有新工具遵循本文契约的字段名与语义，不自行发明。
+> 铁律：①在现有代码基础上增量改造，禁止另起炉灶重写；②一个工单一个 PR，每个 PR 跑全量回归；③不用假数据糊弄，工具查不到就如实返回查不到；④所有新工具遵循本文契约的字段名与语义，不自行发明；⑤本文所有新增工具均为只读（READ_ONLY 风险级），不引入任何写操作。
 
 ---
 
@@ -23,7 +23,21 @@
 | 平台审计日志 | **平台自身**的操作审计（谁在平台上做了什么）存在哪里、是否有查询接口——这是 M1 的命脉，没有就在映射表里显著标注 |
 | 平台实体 | 租户/任务/策略/存储 的数据模型与 DB 表 |
 
-映射表交付并确认后，按工单 1→5 顺序施工。
+映射表交付并确认后，先做工单 0.5，再按工单 1→5 顺序施工。
+
+---
+
+## 工单 0.5：回归基线与测试资产（验收的地基）
+
+后续所有工单的验收依赖本工单产出。在 `cases/` 目录建三档回归集与黄金场景测试资产：
+
+**回归集**：从真实历史工单脱敏挑选 6-8 例，按三档标注（信息充分 / 有锚点 / 无锚点），每例一个子目录：`ticket.md`（工单原文）+ `expected.md`（该档位的期望行为，充分档=根因，无锚点档=正确降级，不是每例都期望根因）。跑一遍现状 agent，记录基线表。
+
+**G1 测试资产**（配合工单 1/3 验收）：`cases/g1-misop/` — 造一份平台审计记录 fixture（含某外部团队操作员在事故时间窗内修改策略/凭据的记录 + 无关噪声操作）、对应任务失败记录、tenants.yaml 中该团队的条目。格式与工单 0 盘点到的真实审计存储同构。
+
+**G2 测试资产**（配合工单 2 验收）：`cases/g2-chain/` — 一个最小样例代码模块（真实项目里选一条现成的 API→Service→Mapper 链亦可,标注入口与期望链），加一条该链某处打出的日志行原文。
+
+**验收**：基线表完成；G1/G2 资产能被人肉走通（人拿着资产能推出期望结论——人推不出的,agent 也不该被要求推出）。
 
 ---
 
@@ -41,6 +55,8 @@
   可查证面: audit_query(team=oracle-dba), job_history(tenant=oracle-dba)
   注意: 该团队自身系统不可查——查它在平台上的行为痕迹，不要尝试查它的内部日志
 ```
+
+**1d. prompt 增量**：system prompt 增加外部团队纪律："注册表中的接入团队,其内部系统一律不可查;调查其行为走平台侧痕迹(audit/job/api 记录);工单中的外部关键词是路由线索,不是调查终点。"
 
 **验收**：黄金场景 G1（附录 D）通过——含外部团队关键词的工单，agent 首先查 audit/job 痕迹而非报"无法查询"；全量回归绿。
 
@@ -66,11 +82,15 @@
 
 **3c.** 验证者（如已有对抗验证者）人设追加：核验 attribution 证据三件套的真实性。
 
+**3d. prompt 增量**：submit_conclusion 的 schema 描述与 system prompt 增加 attribution 字段说明（四种判定的含义、theirs 的三件套证据要求）。
+
 **验收**：黄金场景 G1 升级版——结论给出 `theirs(oracle-dba)` 且三件套齐；缺证据的 theirs 被门/验证者打回。
 
 ## 工单 4（M4）：假设可执行化
 
 假设板的 `verification` 字段从自由文本升级为结构化（附录 B-4）：声明假设时给出可执行查询（工具名+参数）。harness 收到后**并行执行**这些查询（复用现有并行执行器），结果自动作为工具消息回填，并在假设板标注 `evidence_ref`。模型仍负责判定 CONFIRMED/KILLED——harness 只代跑查询，不代下判断。
+
+**prompt 增量**：set_hypothesis 的 schema 与 system prompt 说明 verification 的结构化写法（工具名+参数+expect），并要求每个假设至少一条可执行验证。
 
 **验收**：单测：含 2 个可执行验证的假设声明 → 两查询并行执行、结果回填；实测：调查轮次相比基线下降（记录数字）。
 
@@ -124,6 +144,35 @@ teams:
 ```json
 {"id":"H1","hypothesis":"...","status":"TESTING",
  "verification":[{"tool":"audit_query","params":{...},"expect":"命中则支持/命中则否定"}]}
+```
+
+## 附录 E：索引存储 DDL 草案（SQLite，起步版）
+
+```sql
+-- 工单 2/3 共用；字段可增不可改名
+CREATE TABLE graph_nodes (
+  id TEXT PRIMARY KEY,            -- 方法全限定名 / 实体 id
+  kind TEXT NOT NULL,             -- method|class|mapper_stmt|http_endpoint|mq_topic|table|tenant|job|policy|storage
+  repo TEXT, file TEXT, line INTEGER,
+  team TEXT,                      -- 归属(挂 registry), 可空
+  boundary INTEGER DEFAULT 0      -- 1=边界节点
+);
+CREATE TABLE graph_edges (
+  src TEXT NOT NULL, dst TEXT NOT NULL,
+  kind TEXT NOT NULL,             -- call|implements|maps_to|reads_config|http_call|mq_produce|mq_consume|depends_on
+  PRIMARY KEY (src, dst, kind)
+);
+CREATE TABLE log_statements (
+  skeleton TEXT NOT NULL,         -- 通配变量后的格式串骨架
+  repo TEXT, file TEXT, line INTEGER, level TEXT
+);
+CREATE TABLE orm_mappings (
+  class TEXT NOT NULL, tbl TEXT NOT NULL,
+  field TEXT, col TEXT, source TEXT   -- jpa|mybatis
+);
+CREATE TABLE config_usages (
+  cfg_key TEXT NOT NULL, repo TEXT, file TEXT, line INTEGER
+);
 ```
 
 ## 附录 C：施工纪律
