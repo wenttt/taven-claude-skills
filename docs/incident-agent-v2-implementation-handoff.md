@@ -78,6 +78,18 @@
 
 历史调查记录增加实体关联（团队/服务/表），检索支持按实体查（"这个租户过去的事故"）。有 dream 固化机制的按 v1 §9.3 接入；没有则只做实体化检索。
 
+## 工单 6（M6）：Teams 接入面
+
+**目标**：结论主动出现在团队的 Teams 频道里；聊天页降为下钻详情页。分三步，6a 独立可交付。
+
+**6a. 推送面（先做，零审批）**：新增 `TeamsNotifier`（契约附录 B-5）。调查轮结束（结论已过验证者）时，向配置的 Workflows 入站 webhook URL POST 一张 Adaptive Card：摘要 + 定责 + 级别/置信 + "查看完整调查"链接（指向聊天详情页的投查锚点）。注意：使用 Teams "Workflows" 应用的入站 webhook（老 Office 365 Connectors 已退役，不要用）。webhook URL 是秘密，走环境变量 `AGENT_TEAMS_WEBHOOK`；未配置时 TeamsNotifier 静默禁用，不影响主流程；推送失败只记事件不抛错。
+
+**6b. 追问面（轻量版）**：Teams Outgoing Webhook——频道成员 `@助手 <追问>` 时 Teams POST 到新端点 `/api/teams/mention`（校验 HMAC 签名，密钥 `AGENT_TEAMS_HMAC`）。请求文本按 §8.2 多轮衔接规则路由到对应调查的 follow-up，同步返回简短回答 + 详情链接。限制如实接受：只能应答提及，不能主动发起。
+
+**6c. 完整版（Azure Bot，可延后）**：Entra 应用 + Azure Bot + messaging endpoint + Teams app manifest，支持频道线程、卡片按钮回传（采纳/驳回直接写 verdict）。**需要租户管理员审批——申请在 6a 交付时就递出去**，代码等审批期间不阻塞。
+
+**验收**：6a——本地跑一次完整调查，测试频道收到卡片，链接可打开对应调查详情；webhook 未配置/不可达时主流程零影响。6b——频道 @提及能得到与聊天页 follow-up 一致的回答；签名校验失败返回 401。
+
 ---
 
 ## 附录 A：tenants.yaml schema
@@ -124,6 +136,16 @@ teams:
 ```json
 {"id":"H1","hypothesis":"...","status":"TESTING",
  "verification":[{"tool":"audit_query","params":{...},"expect":"命中则支持/命中则否定"}]}
+```
+
+**B-5 TeamsNotifier**
+```json
+{"config":{"AGENT_TEAMS_WEBHOOK":"Workflows 入站 webhook URL（未设置=禁用）",
+           "AGENT_TEAMS_HMAC":"6b outgoing webhook 的签名密钥"},
+ "notify(investigation)":"POST Adaptive Card v1.4，超时 5s，失败仅记事件",
+ "card":{"body":["TextBlock: 调查完成 · {id}","TextBlock: {summary，wrap}",
+   "FactSet: 定责 attribution.verdict(+team) / 级别 level · 置信 topConfidence / 验证 是否过验证者"],
+  "actions":[{"Action.OpenUrl":"{chat_base_url}/chat#{investigationId}"}]}}
 ```
 
 ## 附录 C：施工纪律
