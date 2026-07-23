@@ -100,6 +100,20 @@
 
 ---
 
+## 工单 7（生产化补强，可与 M1-M5 并行）：借鉴 AgentScope Java，本项目自实现
+
+**背景与铁律**：[AgentScope Java](https://github.com/agentscope-ai/agentscope-java)（Apache-2.0，阿里，生产级 Java agent 框架）在"分布式/会话/IM/事件"这半做得成熟。本工单**只借鉴其设计，在本项目内用自己的代码实现，绝不引入该框架为依赖**——本项目的价值在排查领域纪律与世界模型（v1/v2 各章），循环必须保持自控、可插人确认。参考其源码是为了少走弯路，不是为了耦合。
+
+下列三项按"生产阻塞度"排，`7a` 是上生产的硬前提，`7b/7c` 是体验/扩展补强。
+
+**7a. 会话与运行态持久化到 DB（上生产硬前提）**：现状会话/LiveRun 存单机内存 LRU——多实例不共享、重启即丢。改造：会话消息、调查记录、运行态落 DB（起步 SQLite/单库即可，接口留出可换 MySQL/PG）；进程重启/换实例后能按会话 id 恢复对话与继续 follow-up。参考 AgentScope 的分布式 backend 设计（Redis/MySQL 会话与记忆、跨副本恢复），取其"无状态 agent + 外置状态存储"的分层,不取其框架实现。**验收**：起两个进程指同一库，A 进程开的调查在 B 进程能续 follow-up；杀掉进程重启后历史调查与在途会话不丢。
+
+**7b. 事件流细粒度化（改善"看得见思考"）**：现状事件较粗。参考 AgentScope 的分层事件模型（thinking / text / tool 各有 start/delta/end 流式事件），把 agent 的思考与工具输出拆成流式增量事件，前端逐字/逐段渲染。**只加事件类型与发射点，不改循环控制流**。**验收**：聊天页能看到思考文本流式出现（而非整段跳出）；旧事件消费方不破坏。
+
+**7c. IM 推送面接口（为将来接内部 IM 留座）**：Teams 因内网回调不可行已砍（历史 commit 保留）。但公司若用飞书/企业微信/钉钉，AgentScope 有现成 channel 模块。本工单**只在本项目定义一个最小 channel 抽象接口**（契约附录 F），并给一个"出站-only"的默认实现骨架（对应 v1 讨论的内网三通道：代理直发/中继桥/邮件）；具体某个 IM 的对接等确定公司 IM 后再填。**先决**：确认公司内部 IM 是什么——是飞书/企微/钉钉之一时，评估能否直接移植 AgentScope 对应 channel 的对接逻辑（仍在本项目内实现，不引框架）。**验收**：接口 + 出站骨架就位，一个假实现能把结论卡投递到日志/本地文件（证明发射点接对了）；未配置任何 channel 时主流程零影响。
+
+**尽调（做 7 之前一次性确认，写进 v2-mapping.md）**：① 坐实 AgentScope 的 LICENSE 文件确为 Apache-2.0（GitHub API 曾读出 licenseInfo 为空，以仓库内 LICENSE 为准）；② 记录参考的具体类/设计点来源，便于回溯；③ 确认公司内部 IM 种类（决定 7c 走向）。
+
 ## 附录 A：tenants.yaml schema
 
 ```yaml
@@ -187,3 +201,17 @@ CREATE TABLE config_usages (
 **G1 误操作定责**：工单："Oracle 那边说凌晨的 RAC 全量备份全失败了，是不是你们平台挂了？" 期望轨迹：实体解析命中 oracle-dba → audit_query 发现 02:1x 该团队操作员修改了备份策略/凭据 → job_history 显示任务因凭据失败 → 我方调度与存储正常（证据）→ 结论 `attribution: theirs(oracle-dba)` + 三件套 + 转交建议。失败判据：报"无法定位"或试图查询对方内部系统。
 
 **G2 链式追查**：从日志报错行出发：日志语句索引反查到打点代码 → trace_chain 拉出 API→Service→Mapper 完整链（含表名）→ 对该表跑只读验证 SQL → 结论因果链每跳有引用。失败判据：链在接口/实现或 Mapper 处断裂且未标注 broken。
+
+## 附录 F：最小 channel 抽象契约（工单 7c）
+
+```java
+// 本项目内定义，不依赖任何框架。形状借鉴 AgentScope 的 dispatch/deliver 二方法接口。
+interface NotifyChannel {
+    String id();                              // "proxy" | "relay" | "email" | "feishu" ...
+    boolean enabled();                        // 未配置=false，主流程据此静默跳过
+    void deliver(Investigation inv);          // 出站：把一次调查结论投递出去
+    // 入站可选：内网出站-only 实现留空；将来公网可达的 channel 再实现
+}
+```
+
+投递内容 = 摘要 + 定责(attribution) + 级别/置信 + 详情页链接（指向内网聊天页 `#{investigationId}`）。出站失败只记事件不抛错。多 channel 时逐个 deliver，互不影响。
